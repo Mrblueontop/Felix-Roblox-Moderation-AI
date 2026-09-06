@@ -28,7 +28,8 @@ app.get("/test-ai", async (req, res) => {
     res.send(completion.choices[0].message.content);
   } catch (error) {
     console.error(error);
-    res.status(500).send("Groq connection failed.");
+    console.error("GROQ ERROR:", error.message);
+    console.error("STATUS:", error.status);
   }
 });
 
