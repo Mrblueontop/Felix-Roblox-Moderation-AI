@@ -19,16 +19,128 @@ const YOUTUBE_SCOPES = [
   "https://www.googleapis.com/auth/youtube.force-ssl"
 ];
 
-app.use(express.json());
-
 /* =========================
    CONFIG
 ========================= */
 
 const POLL_INTERVAL = 10 * 1000;
-const MAX_VIDEOS_TO_CHECK = 1000;
+const MAX_VIDEOS_TO_CHECK = 5;
+const REMOVE_CONFIDENCE = 0.85;
 
 const processedComments = new Map();
+
+app.use(express.json());
+
+/* =========================
+   DISCORD WEBHOOK
+========================= */
+
+async function sendDiscordLog({
+  action,
+  author,
+  comment,
+  confidence,
+  reason,
+  videoId,
+  removed
+}) {
+  const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
+
+  if (!webhookUrl) {
+    console.log("DISCORD_WEBHOOK_URL is not configured.");
+    return;
+  }
+
+  try {
+    const percent = Math.round(confidence * 100);
+
+    const payload = {
+      username: "YouTube AI Moderator",
+      embeds: [
+        {
+          title:
+            action === "REMOVE"
+              ? "🗑️ Comment Removed"
+              : action === "SPECIAL"
+                ? "❤️ Special Comment"
+                : action === "REVIEW"
+                  ? "⚠️ Comment Review"
+                  : "✅ Comment Allowed",
+
+          fields: [
+            {
+              name: "Author",
+              value: author || "Unknown",
+              inline: true
+            },
+            {
+              name: "Action",
+              value: action,
+              inline: true
+            },
+            {
+              name: "Confidence",
+              value: `${percent}%`,
+              inline: true
+            },
+            {
+              name: "Comment",
+              value:
+                String(comment || "Unknown").slice(0, 1024)
+            },
+            {
+              name: "Reason",
+              value:
+                String(reason || "No reason provided").slice(0, 1024)
+            },
+            {
+              name: "YouTube Action",
+              value: removed
+                ? "Comment rejected"
+                : "No action taken",
+              inline: true
+            }
+          ]
+        }
+      ]
+    };
+
+    if (videoId) {
+      payload.embeds[0].fields.push({
+        name: "Video ID",
+        value: videoId,
+        inline: true
+      });
+    }
+
+    const response = await fetch(webhookUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+
+      console.error(
+        "DISCORD WEBHOOK ERROR:",
+        response.status,
+        text
+      );
+
+      return;
+    }
+
+    console.log("Discord log sent.");
+  } catch (error) {
+    console.error(
+      "DISCORD ERROR:",
+      error.message
+    );
+  }
+}
 
 /* =========================
    BASIC ROUTES
@@ -52,8 +164,14 @@ app.get("/auth/youtube", (req, res) => {
 
     res.redirect(authUrl);
   } catch (error) {
-    console.error("AUTH URL ERROR:", error.message);
-    res.status(500).send("Could not start YouTube authorization.");
+    console.error(
+      "AUTH URL ERROR:",
+      error.message
+    );
+
+    res.status(500).send(
+      "Could not start YouTube authorization."
+    );
   }
 });
 
@@ -67,9 +185,13 @@ app.get("/oauth2callback", async (req, res) => {
       );
     }
 
-    const { tokens } = await oauth2Client.getToken(code);
+    const { tokens } =
+      await oauth2Client.getToken(code);
 
-    console.log("YouTube OAuth successful.");
+    console.log(
+      "YouTube OAuth successful."
+    );
+
     console.log(
       "Refresh token received:",
       Boolean(tokens.refresh_token)
@@ -81,9 +203,20 @@ app.get("/oauth2callback", async (req, res) => {
       );
     }
 
+    /*
+      IMPORTANT:
+
+      The refresh token should be copied into Railway Variables:
+
+      YOUTUBE_REFRESH_TOKEN
+
+      Never put the token in GitHub or send it to anyone.
+    */
+
     res.send(`
       <h2>✅ YouTube authorization successful!</h2>
-      <p>Your refresh token was received.</p>
+      <p>Your YouTube account was authorized.</p>
+      <p>The refresh token was received by the server.</p>
       <p>Close this page.</p>
     `);
 
@@ -104,7 +237,8 @@ app.get("/oauth2callback", async (req, res) => {
 ========================= */
 
 function getYouTubeClient() {
-  const refreshToken = process.env.YOUTUBE_REFRESH_TOKEN;
+  const refreshToken =
+    process.env.YOUTUBE_REFRESH_TOKEN;
 
   if (!refreshToken) {
     throw new Error(
@@ -128,38 +262,47 @@ function getYouTubeClient() {
 
 app.get("/test-youtube", async (req, res) => {
   try {
-    const youtube = getYouTubeClient();
+    const youtube =
+      getYouTubeClient();
 
-    const response = await youtube.channels.list({
-      part: "snippet,contentDetails",
-      mine: true
-    });
+    const response =
+      await youtube.channels.list({
+        part: "snippet,contentDetails",
+        mine: true
+      });
 
-    const channel = response.data.items?.[0];
+    const channel =
+      response.data.items?.[0];
 
     if (!channel) {
       return res.status(500).json({
         connected: false,
-        error: "YouTube channel could not be found."
+        error:
+          "YouTube channel could not be found."
       });
     }
 
     res.json({
       connected: true,
-      channelName: channel.snippet.title,
-      channelId: channel.id,
-      message: "YouTube connection is working."
+      channelName:
+        channel.snippet.title,
+      channelId:
+        channel.id,
+      message:
+        "YouTube connection is working."
     });
 
   } catch (error) {
     console.error(
       "YOUTUBE TEST ERROR:",
-      error.response?.data || error.message
+      error.response?.data ||
+        error.message
     );
 
     res.status(500).json({
       connected: false,
-      error: "YouTube connection failed."
+      error:
+        "YouTube connection failed."
     });
   }
 });
@@ -169,13 +312,14 @@ app.get("/test-youtube", async (req, res) => {
 ========================= */
 
 async function moderateComment(comment) {
-  const completion = await groq.chat.completions.create({
-    model: "openai/gpt-oss-120b",
+  const completion =
+    await groq.chat.completions.create({
+      model: "openai/gpt-oss-120b",
 
-    messages: [
-      {
-        role: "system",
-        content: `
+      messages: [
+        {
+          role: "system",
+          content: `
 You are an AI YouTube comment moderator.
 
 Classify the comment into exactly ONE action:
@@ -206,6 +350,7 @@ REMOVE = clearly unacceptable content, including:
 Direct creator insults should be REMOVE even when they are slang or joking.
 
 Examples REMOVE:
+
 "your video sucks"
 "your corny bro"
 "holy cornball bro delete ts rn"
@@ -214,6 +359,7 @@ Examples REMOVE:
 "your content is trash"
 
 Normal criticism is ALLOW:
+
 "I didn't really enjoy this video"
 "I think the editing could be better"
 "This wasn't my favorite video"
@@ -221,7 +367,9 @@ Normal criticism is ALLOW:
 Do NOT remove innocent uses of words.
 
 Example:
+
 "I lost my keys"
+
 = ALLOW
 
 Understand context and intent.
@@ -237,18 +385,20 @@ Return ONLY valid JSON:
   "confidence": 0.00,
   "reason": "short explanation"
 }
-        `
-      },
-      {
-        role: "user",
-        content: `Comment to moderate:\n${comment}`
-      }
-    ],
+          `
+        },
+        {
+          role: "user",
+          content:
+            `Comment to moderate:\n${comment}`
+        }
+      ],
 
-    temperature: 0
-  });
+      temperature: 0
+    });
 
-  const raw = completion.choices[0].message.content;
+  const raw =
+    completion.choices[0].message.content;
 
   let parsed;
 
@@ -267,13 +417,18 @@ Return ONLY valid JSON:
     "REMOVE"
   ];
 
-  if (!validActions.includes(parsed.action)) {
+  if (
+    !validActions.includes(
+      parsed.action
+    )
+  ) {
     throw new Error(
       `Invalid AI action: ${parsed.action}`
     );
   }
 
-  let confidence = Number(parsed.confidence);
+  let confidence =
+    Number(parsed.confidence);
 
   if (!Number.isFinite(confidence)) {
     confidence = 0;
@@ -287,7 +442,8 @@ Return ONLY valid JSON:
   return {
     action: parsed.action,
     confidence,
-    reason: parsed.reason || ""
+    reason:
+      parsed.reason || ""
   };
 }
 
@@ -295,7 +451,10 @@ Return ONLY valid JSON:
    REMOVE COMMENT
 ========================= */
 
-async function removeComment(youtube, commentId) {
+async function removeComment(
+  youtube,
+  commentId
+) {
   await youtube.comments.setModerationStatus({
     id: commentId,
     moderationStatus: "rejected"
@@ -303,52 +462,70 @@ async function removeComment(youtube, commentId) {
 }
 
 /* =========================
-   GET CHANNEL VIDEOS
+   GET RECENT VIDEOS
 ========================= */
 
-async function getRecentVideos(youtube) {
-  const channelResponse = await youtube.channels.list({
-    part: "contentDetails",
-    mine: true
-  });
+async function getRecentVideos(
+  youtube
+) {
+  const channelResponse =
+    await youtube.channels.list({
+      part: "contentDetails",
+      mine: true
+    });
 
-  const channel = channelResponse.data.items?.[0];
+  const channel =
+    channelResponse.data.items?.[0];
 
   if (!channel) {
-    throw new Error("Could not find authenticated YouTube channel.");
+    throw new Error(
+      "Could not find authenticated YouTube channel."
+    );
   }
 
   const uploadsPlaylistId =
-    channel.contentDetails.relatedPlaylists.uploads;
+    channel.contentDetails
+      .relatedPlaylists.uploads;
 
   const playlistResponse =
     await youtube.playlistItems.list({
       part: "contentDetails",
-      playlistId: uploadsPlaylistId,
-      maxResults: MAX_VIDEOS_TO_CHECK
+      playlistId:
+        uploadsPlaylistId,
+      maxResults:
+        MAX_VIDEOS_TO_CHECK
     });
 
-  return (playlistResponse.data.items || [])
-    .map(item => item.contentDetails.videoId)
+  return (
+    playlistResponse.data.items || []
+  )
+    .map(
+      item =>
+        item.contentDetails.videoId
+    )
     .filter(Boolean);
 }
 
 /* =========================
-   MODERATE COMMENTS
+   CHECK COMMENTS
 ========================= */
 
 async function checkComments() {
   try {
-    const youtube = getYouTubeClient();
+    const youtube =
+      getYouTubeClient();
 
-    const videoIds = await getRecentVideos(youtube);
+    const videoIds =
+      await getRecentVideos(
+        youtube
+      );
 
     console.log(
       `Checking ${videoIds.length} recent videos...`
     );
 
     for (const videoId of videoIds) {
-      let nextPageToken = undefined;
+      let nextPageToken;
 
       do {
         const response =
@@ -357,29 +534,43 @@ async function checkComments() {
             videoId,
             maxResults: 100,
             order: "time",
-            pageToken: nextPageToken
+            pageToken:
+              nextPageToken
           });
 
-        const threads = response.data.items || [];
+        const threads =
+          response.data.items || [];
 
         for (const thread of threads) {
           const topLevelComment =
-            thread.snippet?.topLevelComment;
+            thread.snippet
+              ?.topLevelComment;
 
-          const commentId = topLevelComment?.id;
+          const commentId =
+            topLevelComment?.id;
 
           const comment =
-            topLevelComment?.snippet?.textDisplay ||
-            topLevelComment?.snippet?.textOriginal;
+            topLevelComment?.snippet
+              ?.textDisplay ||
+            topLevelComment?.snippet
+              ?.textOriginal;
 
           const author =
-            topLevelComment?.snippet?.authorDisplayName;
+            topLevelComment?.snippet
+              ?.authorDisplayName;
 
-          if (!commentId || !comment) {
+          if (
+            !commentId ||
+            !comment
+          ) {
             continue;
           }
 
-          if (processedComments.has(commentId)) {
+          if (
+            processedComments.has(
+              commentId
+            )
+          ) {
             continue;
           }
 
@@ -390,13 +581,27 @@ async function checkComments() {
 
           try {
             const result =
-              await moderateComment(comment);
+              await moderateComment(
+                comment
+              );
 
             console.log("");
-            console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-            console.log("COMMENT:", comment);
-            console.log("AUTHOR:", author || "Unknown");
-            console.log("ACTION:", result.action);
+            console.log(
+              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            );
+            console.log(
+              "COMMENT:",
+              comment
+            );
+            console.log(
+              "AUTHOR:",
+              author ||
+                "Unknown"
+            );
+            console.log(
+              "ACTION:",
+              result.action
+            );
             console.log(
               "CONFIDENCE:",
               result.confidence
@@ -406,31 +611,64 @@ async function checkComments() {
               result.reason
             );
 
-            if (
-              result.action === "REMOVE" &&
-              result.confidence >= 0.85
-            ) {
-              await removeComment(
-                youtube,
-                commentId
-              );
+            let removed = false;
 
-              console.log(
-                "🗑️ COMMENT REMOVED"
-              );
+            if (
+              result.action ===
+                "REMOVE" &&
+              result.confidence >=
+                REMOVE_CONFIDENCE
+            ) {
+              try {
+                await removeComment(
+                  youtube,
+                  commentId
+                );
+
+                removed = true;
+
+                console.log(
+                  "🗑️ COMMENT REMOVED"
+                );
+              } catch (error) {
+                console.error(
+                  "REMOVE ERROR:",
+                  error.response
+                    ?.data ||
+                    error.message
+                );
+              }
             }
 
-            if (result.action === "SPECIAL") {
+            if (
+              result.action ===
+              "SPECIAL"
+            ) {
               console.log(
                 "❤️ SPECIAL COMMENT DETECTED"
               );
 
               console.log(
-                "NOTE: YouTube Data API does not provide an official comment-heart write endpoint."
+                "YouTube does not expose an official comment-heart write endpoint through the Data API."
               );
             }
 
-            console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            await sendDiscordLog({
+              action:
+                result.action,
+              author,
+              comment,
+              confidence:
+                result.confidence,
+              reason:
+                result.reason,
+              videoId,
+              removed
+            });
+
+            console.log(
+              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            );
             console.log("");
 
           } catch (error) {
@@ -442,9 +680,12 @@ async function checkComments() {
         }
 
         nextPageToken =
-          response.data.nextPageToken;
+          response.data
+            .nextPageToken;
 
-      } while (nextPageToken);
+      } while (
+        nextPageToken
+      );
     }
 
     cleanupProcessedComments();
@@ -452,81 +693,110 @@ async function checkComments() {
   } catch (error) {
     console.error(
       "COMMENT CHECK ERROR:",
-      error.response?.data || error.message
+      error.response
+        ?.data ||
+        error.message
     );
   }
 }
 
 /* =========================
-   MEMORY CLEANUP
+   CLEANUP
 ========================= */
 
 function cleanupProcessedComments() {
   const expiration =
-    Date.now() - 24 * 60 * 60 * 1000;
+    Date.now() -
+    24 * 60 * 60 * 1000;
 
-  for (const [
-    commentId,
-    timestamp
-  ] of processedComments.entries()) {
-    if (timestamp < expiration) {
-      processedComments.delete(commentId);
+  for (
+    const [
+      commentId,
+      timestamp
+    ] of processedComments.entries()
+  ) {
+    if (
+      timestamp < expiration
+    ) {
+      processedComments.delete(
+        commentId
+      );
     }
   }
 }
 
 /* =========================
-   TEST AI ENDPOINT
+   MANUAL AI TEST
 ========================= */
 
-app.post("/moderate-test", async (req, res) => {
-  try {
-    const { comment } = req.body;
+app.post(
+  "/moderate-test",
+  async (req, res) => {
+    try {
+      const {
+        comment
+      } = req.body;
 
-    if (!comment || typeof comment !== "string") {
-      return res.status(400).json({
-        error: "Please provide a comment."
+      if (
+        !comment ||
+        typeof comment !==
+          "string"
+      ) {
+        return res.status(400).json({
+          error:
+            "Please provide a comment."
+        });
+      }
+
+      const result =
+        await moderateComment(
+          comment
+        );
+
+      res.json({
+        testMode: true,
+        action:
+          result.action,
+        confidence:
+          result.confidence,
+        reason:
+          result.reason,
+        youtubeActionTaken:
+          false
+      });
+
+    } catch (error) {
+      console.error(
+        "MODERATION ERROR:",
+        error.message
+      );
+
+      res.status(500).json({
+        error:
+          "AI moderation failed."
       });
     }
-
-    const result =
-      await moderateComment(comment);
-
-    res.json({
-      testMode: true,
-      action: result.action,
-      confidence: result.confidence,
-      reason: result.reason,
-      youtubeActionTaken: false
-    });
-
-  } catch (error) {
-    console.error(
-      "MODERATION ERROR:",
-      error.message
-    );
-
-    res.status(500).json({
-      error: "AI moderation failed."
-    });
   }
-});
+);
 
 /* =========================
    START SERVER
 ========================= */
 
-app.listen(PORT, () => {
-  console.log(
-    `Moderator running on port ${PORT}`
-  );
-
-  setTimeout(() => {
-    checkComments();
-
-    setInterval(
-      checkComments,
-      POLL_INTERVAL
+app.listen(
+  PORT,
+  () => {
+    console.log(
+      `Moderator running on port ${PORT}`
     );
-  }, 5000);
-});
+
+    setTimeout(() => {
+      checkComments();
+
+      setInterval(
+        checkComments,
+        POLL_INTERVAL
+      );
+    }, 5000);
+  }
+);
