@@ -7,6 +7,7 @@
   },
   "dependencies": {
     "express": "^5.1.0",
-    "groq-sdk": "^0.37.0"
+    "groq-sdk": "^0.37.0",
+    "googleapis": "^166.0.0"
   }
 }
