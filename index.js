@@ -1,5 +1,6 @@
 const express = require("express");
 const Groq = require("groq-sdk");
+const { google } = require("googleapis");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -8,11 +9,26 @@ const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY
 });
 
+// YouTube OAuth
+const oauth2Client = new google.auth.OAuth2(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  process.env.GOOGLE_REDIRECT_URI
+);
+
+const YOUTUBE_SCOPES = [
+  "https://www.googleapis.com/auth/youtube.force-ssl"
+];
+
 app.use(express.json());
 
 app.get("/", (req, res) => {
   res.send("🤖 YouTube AI Moderator is online!");
 });
+
+// ================================
+// TEST GROQ CONNECTION
+// ================================
 
 app.get("/test-ai", async (req, res) => {
   try {
@@ -31,11 +47,74 @@ app.get("/test-ai", async (req, res) => {
   } catch (error) {
     console.error("GROQ ERROR:", error.message);
     console.error("STATUS:", error.status);
+
     res.status(500).send("Groq connection failed.");
   }
 });
 
+// ================================
+// YOUTUBE OAUTH
+// ================================
+
+app.get("/auth/youtube", (req, res) => {
+  try {
+    const authUrl = oauth2Client.generateAuthUrl({
+      access_type: "offline",
+      prompt: "consent",
+      scope: YOUTUBE_SCOPES
+    });
+
+    res.redirect(authUrl);
+  } catch (error) {
+    console.error("AUTH URL ERROR:", error.message);
+
+    res.status(500).send("Could not start YouTube authorization.");
+  }
+});
+
+app.get("/oauth2callback", async (req, res) => {
+  try {
+    const { code } = req.query;
+
+    if (!code) {
+      return res.status(400).send(
+        "Missing OAuth authorization code."
+      );
+    }
+
+    const { tokens } = await oauth2Client.getToken(code);
+
+    console.log("YouTube OAuth successful.");
+    console.log(
+      "Refresh token received:",
+      Boolean(tokens.refresh_token)
+    );
+
+    // IMPORTANT:
+    // We are NOT performing any YouTube actions yet.
+    // We will securely store the refresh token in a later step.
+
+    res.send(
+      "✅ YouTube authorization successful! You can close this page."
+    );
+
+  } catch (error) {
+    console.error(
+      "YOUTUBE OAUTH ERROR:",
+      error.response?.data || error.message
+    );
+
+    res.status(500).send(
+      "YouTube authorization failed."
+    );
+  }
+});
+
+// ================================
+// AI MODERATION TEST
+// ================================
 // TEST MODE ONLY — does NOT touch YouTube.
+
 app.post("/moderate-test", async (req, res) => {
   try {
     const { comment } = req.body;
@@ -48,6 +127,7 @@ app.post("/moderate-test", async (req, res) => {
 
     const completion = await groq.chat.completions.create({
       model: "openai/gpt-oss-120b",
+
       messages: [
         {
           role: "system",
@@ -90,22 +170,31 @@ Normal criticism is ALLOW:
 "This wasn't my favorite video"
 
 Do NOT remove innocent uses of words merely because they resemble prohibited language.
-For example, "I lost my keys" is ALLOW.
 
-Consider the entire context and intent. Do not remove a comment solely because it contains an isolated word that could have an innocent meaning.
+For example:
+"I lost my keys"
+should be ALLOW.
+
+Consider the entire context and intent.
+
+Do not remove a comment solely because it contains an isolated word that could have an innocent meaning.
 
 Return ONLY valid JSON:
+
 {
   "action": "SPECIAL | ALLOW | REVIEW | REMOVE",
   "confidence": 0.00,
   "reason": "short explanation"
-}`
+}
+`
         },
+
         {
           role: "user",
           content: `Comment to moderate:\n${comment}`
         }
       ],
+
       temperature: 0
     });
 
@@ -122,22 +211,58 @@ Return ONLY valid JSON:
       });
     }
 
+    // Safety validation.
+    const validActions = [
+      "SPECIAL",
+      "ALLOW",
+      "REVIEW",
+      "REMOVE"
+    ];
+
+    if (!validActions.includes(parsed.action)) {
+      return res.status(500).json({
+        error: "AI returned an invalid moderation action.",
+        raw: result
+      });
+    }
+
+    let confidence = Number(parsed.confidence);
+
+    if (!Number.isFinite(confidence)) {
+      confidence = 0;
+    }
+
+    confidence = Math.max(
+      0,
+      Math.min(1, confidence)
+    );
+
     res.json({
       testMode: true,
       action: parsed.action,
-      confidence: parsed.confidence,
-      reason: parsed.reason,
+      confidence,
+      reason: String(parsed.reason || ""),
       youtubeActionTaken: false
     });
 
   } catch (error) {
-    console.error("MODERATION ERROR:", error.message);
+    console.error(
+      "MODERATION ERROR:",
+      error.message
+    );
+
     res.status(500).json({
       error: "AI moderation failed."
     });
   }
 });
 
+// ================================
+// START SERVER
+// ================================
+
 app.listen(PORT, () => {
-  console.log(`Moderator running on port ${PORT}`);
+  console.log(
+    `Moderator running on port ${PORT}`
+  );
 });
