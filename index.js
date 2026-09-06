@@ -25,8 +25,8 @@ app.use(express.json());
    CONFIG
 ========================= */
 
-const POLL_INTERVAL = 60 * 1000;
-const MAX_VIDEOS_TO_CHECK = 5;
+const POLL_INTERVAL = 10 * 1000;
+const MAX_VIDEOS_TO_CHECK = 1000;
 
 const processedComments = new Map();
 
