@@ -16,7 +16,7 @@ const YOUTUBE_SCOPES = [
 ];
 
 const POLL_INTERVAL = 10 * 1000;
-const MAX_VIDEOS_TO_CHECK = 5;
+const MAX_VIDEOS_TO_CHECK = 5000;
 const REMOVE_CONFIDENCE = 0.85;
 
 // Prevent repeatedly processing the same comment/reply.
