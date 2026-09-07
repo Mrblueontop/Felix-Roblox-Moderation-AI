@@ -3,11 +3,24 @@ const Groq = require("groq-sdk");
 const { google } = require("googleapis");
 
 const app = express();
+app.use(express.json());
+
 const PORT = process.env.PORT || 3000;
 
 const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY
+  apiKey: process.env.GROQ_API_KEY,
 });
+
+const YOUTUBE_SCOPES = [
+  "https://www.googleapis.com/auth/youtube.force-ssl",
+];
+
+const POLL_INTERVAL = 10 * 1000;
+const MAX_VIDEOS_TO_CHECK = 5;
+const REMOVE_CONFIDENCE = 0.85;
+
+// Prevent repeatedly processing the same comment/reply.
+const processedComments = new Map();
 
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
@@ -15,25 +28,9 @@ const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_REDIRECT_URI
 );
 
-const YOUTUBE_SCOPES = [
-  "https://www.googleapis.com/auth/youtube.force-ssl"
-];
-
-/* =========================
-   CONFIG
-========================= */
-
-const POLL_INTERVAL = 10 * 1000;
-const MAX_VIDEOS_TO_CHECK = 5;
-const REMOVE_CONFIDENCE = 0.85;
-
-const processedComments = new Map();
-
-app.use(express.json());
-
-/* =========================
-   DISCORD WEBHOOK
-========================= */
+// --------------------------------------------------
+// Discord logging
+// --------------------------------------------------
 
 async function sendDiscordLog({
   action,
@@ -42,315 +39,150 @@ async function sendDiscordLog({
   confidence,
   reason,
   videoId,
-  removed
+  type,
+  removed,
 }) {
-  const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
+  const webhook = process.env.DISCORD_WEBHOOK_URL;
 
-  if (!webhookUrl) {
+  if (!webhook) {
     console.log("DISCORD_WEBHOOK_URL is not configured.");
     return;
   }
 
   try {
-    const percent = Math.round(confidence * 100);
-
-    const payload = {
-      username: "YouTube AI Moderator",
-      embeds: [
-        {
-          title:
-            action === "REMOVE"
-              ? "🗑️ Comment Removed"
-              : action === "SPECIAL"
-                ? "❤️ Special Comment"
-                : action === "REVIEW"
-                  ? "⚠️ Comment Review"
-                  : "✅ Comment Allowed",
-
-          fields: [
-            {
-              name: "Author",
-              value: author || "Unknown",
-              inline: true
-            },
-            {
-              name: "Action",
-              value: action,
-              inline: true
-            },
-            {
-              name: "Confidence",
-              value: `${percent}%`,
-              inline: true
-            },
-            {
-              name: "Comment",
-              value:
-                String(comment || "Unknown").slice(0, 1024)
-            },
-            {
-              name: "Reason",
-              value:
-                String(reason || "No reason provided").slice(0, 1024)
-            },
-            {
-              name: "YouTube Action",
-              value: removed
-                ? "Comment rejected"
-                : "No action taken",
-              inline: true
-            }
-          ]
-        }
-      ]
-    };
-
-    if (videoId) {
-      payload.embeds[0].fields.push({
-        name: "Video ID",
-        value: videoId,
-        inline: true
-      });
-    }
-
-    const response = await fetch(webhookUrl, {
+    const response = await fetch(webhook, {
       method: "POST",
       headers: {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify({
+        embeds: [
+          {
+            title:
+              action === "REMOVE"
+                ? "🗑️ Comment Removed"
+                : action === "SPECIAL"
+                  ? "⭐ Special Comment"
+                  : "✅ Comment Allowed",
+
+            fields: [
+              {
+                name: "Author",
+                value: author || "Unknown",
+                inline: true,
+              },
+              {
+                name: "Type",
+                value: type || "Comment",
+                inline: true,
+              },
+              {
+                name: "Action",
+                value: action || "UNKNOWN",
+                inline: true,
+              },
+              {
+                name: "Confidence",
+                value: `${Math.round((confidence || 0) * 100)}%`,
+                inline: true,
+              },
+              {
+                name: "Reason",
+                value: reason || "No reason provided",
+              },
+              {
+                name: "Comment",
+                value:
+                  comment && comment.length > 1000
+                    ? comment.slice(0, 1000) + "..."
+                    : comment || "(empty)",
+              },
+              {
+                name: "Removed",
+                value: removed ? "Yes" : "No",
+                inline: true,
+              },
+              {
+                name: "Video ID",
+                value: videoId || "Unknown",
+                inline: true,
+              },
+            ],
+            timestamp: new Date().toISOString(),
+          },
+        ],
+      }),
     });
 
     if (!response.ok) {
-      const text = await response.text();
-
       console.error(
-        "DISCORD WEBHOOK ERROR:",
+        "Discord webhook failed:",
         response.status,
-        text
+        await response.text()
       );
-
-      return;
     }
-
-    console.log("Discord log sent.");
   } catch (error) {
-    console.error(
-      "DISCORD ERROR:",
-      error.message
-    );
+    console.error("Discord logging error:", error.message);
   }
 }
 
-/* =========================
-   BASIC ROUTES
-========================= */
-
-app.get("/", (req, res) => {
-  res.send("🤖 YouTube AI Moderator is online!");
-});
-
-/* =========================
-   YOUTUBE OAUTH
-========================= */
-
-app.get("/auth/youtube", (req, res) => {
-  try {
-    const authUrl = oauth2Client.generateAuthUrl({
-      access_type: "offline",
-      prompt: "consent",
-      scope: YOUTUBE_SCOPES
-    });
-
-    res.redirect(authUrl);
-  } catch (error) {
-    console.error(
-      "AUTH URL ERROR:",
-      error.message
-    );
-
-    res.status(500).send(
-      "Could not start YouTube authorization."
-    );
-  }
-});
-
-app.get("/oauth2callback", async (req, res) => {
-  try {
-    const { code } = req.query;
-
-    if (!code) {
-      return res.status(400).send(
-        "Missing OAuth authorization code."
-      );
-    }
-
-    const { tokens } =
-      await oauth2Client.getToken(code);
-
-    console.log(
-      "YouTube OAuth successful."
-    );
-
-    console.log(
-      "Refresh token received:",
-      Boolean(tokens.refresh_token)
-    );
-
-    if (!tokens.refresh_token) {
-      return res.status(400).send(
-        "Google did not provide a refresh token. Try authorizing again."
-      );
-    }
-
-    /*
-      IMPORTANT:
-
-      The refresh token should be copied into Railway Variables:
-
-      YOUTUBE_REFRESH_TOKEN
-
-      Never put the token in GitHub or send it to anyone.
-    */
-
-    res.send(`
-      <h2>✅ YouTube authorization successful!</h2>
-      <p>Your YouTube account was authorized.</p>
-      <p>The refresh token was received by the server.</p>
-      <p>Close this page.</p>
-    `);
-
-  } catch (error) {
-    console.error(
-      "YOUTUBE OAUTH ERROR:",
-      error.response?.data || error.message
-    );
-
-    res.status(500).send(
-      "YouTube authorization failed."
-    );
-  }
-});
-
-/* =========================
-   YOUTUBE CLIENT
-========================= */
+// --------------------------------------------------
+// YouTube authentication
+// --------------------------------------------------
 
 function getYouTubeClient() {
-  const refreshToken =
-    process.env.YOUTUBE_REFRESH_TOKEN;
+  const refreshToken = process.env.YOUTUBE_REFRESH_TOKEN;
 
   if (!refreshToken) {
-    throw new Error(
-      "YOUTUBE_REFRESH_TOKEN is missing from Railway Variables."
-    );
+    throw new Error("YOUTUBE_REFRESH_TOKEN is missing.");
   }
 
   oauth2Client.setCredentials({
-    refresh_token: refreshToken
+    refresh_token: refreshToken,
   });
 
   return google.youtube({
     version: "v3",
-    auth: oauth2Client
+    auth: oauth2Client,
   });
 }
 
-/* =========================
-   TEST YOUTUBE CONNECTION
-========================= */
+// --------------------------------------------------
+// AI moderation
+// --------------------------------------------------
 
-app.get("/test-youtube", async (req, res) => {
-  try {
-    const youtube =
-      getYouTubeClient();
+async function moderateText(text) {
+  const prompt = `
+You are a strict but fair YouTube comment moderator.
 
-    const response =
-      await youtube.channels.list({
-        part: "snippet,contentDetails",
-        mine: true
-      });
+Analyze this YouTube comment/reply and classify it.
 
-    const channel =
-      response.data.items?.[0];
+REMOVE comments that contain:
+- Direct insults toward the creator or another person
+- Harassment or bullying
+- Threats
+- Hate speech
+- Sexual or inappropriate content
+- "kys" or similar suicide encouragement
+- Spam
+- Scams
+- Obvious malicious promotion
+- Severe profanity directed at someone
+- Evasive versions of prohibited language
 
-    if (!channel) {
-      return res.status(500).json({
-        connected: false,
-        error:
-          "YouTube channel could not be found."
-      });
-    }
+The user may try to evade moderation using:
+- Misspellings
+- Extra spaces
+- Punctuation
+- Numbers
+- Unicode lookalikes
+- Emoji inserted into words
+- Repeated letters
+- Coded language
+- Weird capitalization
+- Character substitutions
 
-    res.json({
-      connected: true,
-      channelName:
-        channel.snippet.title,
-      channelId:
-        channel.id,
-      message:
-        "YouTube connection is working."
-    });
-
-  } catch (error) {
-    console.error(
-      "YOUTUBE TEST ERROR:",
-      error.response?.data ||
-        error.message
-    );
-
-    res.status(500).json({
-      connected: false,
-      error:
-        "YouTube connection failed."
-    });
-  }
-});
-
-/* =========================
-   AI MODERATION
-========================= */
-
-async function moderateComment(comment) {
-  const completion =
-    await groq.chat.completions.create({
-      model: "openai/gpt-oss-120b",
-
-      messages: [
-        {
-          role: "system",
-          content: `
-You are an AI YouTube comment moderator.
-
-Classify the comment into exactly ONE action:
-
-SPECIAL = exceptionally wholesome, supportive, or genuinely encouraging.
-
-ALLOW = appropriate, normal, or constructive criticism.
-
-REVIEW = genuinely ambiguous content where you cannot confidently determine whether it is an attack, harassment, or inappropriate content.
-
-REMOVE = clearly unacceptable content, including:
-
-- Direct insults or roasts targeting the creator.
-- Insults or roasts targeting the creator's videos/content.
-- Harassment or bullying directed at the creator.
-- Threats.
-- Hateful content.
-- Sexual or seriously inappropriate content.
-- Scams.
-- Obvious spam.
-- "kys" or expressions encouraging suicide/self-harm.
-- Evasive variants of prohibited language.
-- Insults disguised with slang or jokes.
-- Spam designed to manipulate engagement.
-- Repeated promotional comments.
-- Malicious or deceptive comments.
-
-Direct creator insults should be REMOVE even when they are slang or joking.
-
-Examples REMOVE:
-
+Examples that SHOULD be removed:
 "your video sucks"
 "your corny bro"
 "holy cornball bro delete ts rn"
@@ -358,445 +190,457 @@ Examples REMOVE:
 "go kys bro"
 "your content is trash"
 
-Normal criticism is ALLOW:
+IMPORTANT:
+Constructive criticism should NOT be removed.
 
+Examples that should be allowed:
 "I didn't really enjoy this video"
 "I think the editing could be better"
 "This wasn't my favorite video"
 
-Do NOT remove innocent uses of words.
+Do NOT remove a comment simply because it disagrees with the creator.
 
-Example:
+Also identify exceptionally wholesome, positive, supportive, or heartwarming comments as SPECIAL.
 
-"I lost my keys"
-
-= ALLOW
-
-Understand context and intent.
-
-Look through obvious spelling tricks, spacing, punctuation,
-numbers, Unicode lookalikes, repeated characters,
-inserted symbols/emojis, and other attempts to evade moderation.
-
-Return ONLY valid JSON:
+Return ONLY valid JSON in exactly this format:
 
 {
-  "action": "SPECIAL | ALLOW | REVIEW | REMOVE",
-  "confidence": 0.00,
+  "action": "REMOVE" | "ALLOW" | "SPECIAL",
+  "confidence": 0.0,
   "reason": "short explanation"
 }
-          `
+
+Comment:
+${text}
+`;
+
+  try {
+    const completion = await groq.chat.completions.create({
+      model: "openai/gpt-oss-120b",
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a precise YouTube moderation classifier. Return only JSON.",
         },
         {
           role: "user",
-          content:
-            `Comment to moderate:\n${comment}`
-        }
+          content: prompt,
+        },
       ],
-
-      temperature: 0
     });
 
-  const raw =
-    completion.choices[0].message.content;
+    const raw = completion.choices?.[0]?.message?.content?.trim();
 
-  let parsed;
+    if (!raw) {
+      throw new Error("Groq returned an empty response.");
+    }
 
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error(
-      `AI returned invalid JSON: ${raw}`
-    );
+    // Handle accidental markdown fences.
+    const cleaned = raw
+      .replace(/^```json\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/\s*```$/i, "")
+      .trim();
+
+    const result = JSON.parse(cleaned);
+
+    if (
+      !["REMOVE", "ALLOW", "SPECIAL"].includes(result.action) ||
+      typeof result.confidence !== "number"
+    ) {
+      throw new Error("Invalid moderation response.");
+    }
+
+    return {
+      action: result.action,
+      confidence: Math.max(0, Math.min(1, result.confidence)),
+      reason: result.reason || "No reason provided",
+    };
+  } catch (error) {
+    console.error("AI moderation error:", error.message);
+
+    // Fail safe: if AI fails, do NOT remove the comment.
+    return {
+      action: "ALLOW",
+      confidence: 0,
+      reason: "AI moderation failed; comment left untouched",
+    };
   }
-
-  const validActions = [
-    "SPECIAL",
-    "ALLOW",
-    "REVIEW",
-    "REMOVE"
-  ];
-
-  if (
-    !validActions.includes(
-      parsed.action
-    )
-  ) {
-    throw new Error(
-      `Invalid AI action: ${parsed.action}`
-    );
-  }
-
-  let confidence =
-    Number(parsed.confidence);
-
-  if (!Number.isFinite(confidence)) {
-    confidence = 0;
-  }
-
-  confidence = Math.max(
-    0,
-    Math.min(1, confidence)
-  );
-
-  return {
-    action: parsed.action,
-    confidence,
-    reason:
-      parsed.reason || ""
-  };
 }
 
-/* =========================
-   REMOVE COMMENT
-========================= */
+// --------------------------------------------------
+// Moderate one comment/reply
+// --------------------------------------------------
 
-async function removeComment(
+async function moderateSingleComment({
   youtube,
-  commentId
-) {
-  await youtube.comments.setModerationStatus({
-    id: commentId,
-    moderationStatus: "rejected"
+  commentId,
+  text,
+  author,
+  videoId,
+  type,
+}) {
+  if (!commentId) return;
+
+  if (processedComments.has(commentId)) {
+    return;
+  }
+
+  processedComments.set(commentId, Date.now());
+
+  console.log(`\nChecking ${type}:`);
+  console.log(`Author: ${author}`);
+  console.log(`Comment: ${text}`);
+
+  const moderation = await moderateText(text);
+
+  console.log(
+    `AI: ${moderation.action} (${Math.round(
+      moderation.confidence * 100
+    )}%)`
+  );
+  console.log(`Reason: ${moderation.reason}`);
+
+  let removed = false;
+
+  if (
+    moderation.action === "REMOVE" &&
+    moderation.confidence >= REMOVE_CONFIDENCE
+  ) {
+    try {
+      await youtube.comments.setModerationStatus({
+        id: commentId,
+        moderationStatus: "rejected",
+      });
+
+      removed = true;
+
+      console.log("🗑️ REMOVED");
+    } catch (error) {
+      console.error(
+        "Failed to remove comment:",
+        error.response?.data || error.message
+      );
+    }
+  } else if (moderation.action === "SPECIAL") {
+    console.log("⭐ SPECIAL COMMENT DETECTED");
+  } else {
+    console.log("✅ ALLOWED");
+  }
+
+  await sendDiscordLog({
+    action: moderation.action,
+    author,
+    comment: text,
+    confidence: moderation.confidence,
+    reason: moderation.reason,
+    videoId,
+    type,
+    removed,
   });
 }
 
-/* =========================
-   GET RECENT VIDEOS
-========================= */
+// --------------------------------------------------
+// Get latest channel videos
+// --------------------------------------------------
 
-async function getRecentVideos(
-  youtube
-) {
-  const channelResponse =
-    await youtube.channels.list({
-      part: "contentDetails",
-      mine: true
-    });
+async function getRecentVideos(youtube) {
+  const channelResponse = await youtube.channels.list({
+    part: "contentDetails",
+    mine: true,
+  });
 
-  const channel =
-    channelResponse.data.items?.[0];
+  const channel = channelResponse.data.items?.[0];
 
   if (!channel) {
-    throw new Error(
-      "Could not find authenticated YouTube channel."
-    );
+    throw new Error("Could not find authenticated YouTube channel.");
   }
 
   const uploadsPlaylistId =
-    channel.contentDetails
-      .relatedPlaylists.uploads;
+    channel.contentDetails.relatedPlaylists.uploads;
 
-  const playlistResponse =
-    await youtube.playlistItems.list({
-      part: "contentDetails",
-      playlistId:
-        uploadsPlaylistId,
-      maxResults:
-        MAX_VIDEOS_TO_CHECK
-    });
+  const response = await youtube.playlistItems.list({
+    part: "contentDetails",
+    playlistId: uploadsPlaylistId,
+    maxResults: MAX_VIDEOS_TO_CHECK,
+  });
 
   return (
-    playlistResponse.data.items || []
-  )
-    .map(
-      item =>
-        item.contentDetails.videoId
-    )
-    .filter(Boolean);
+    response.data.items
+      ?.map((item) => item.contentDetails.videoId)
+      .filter(Boolean) || []
+  );
 }
 
-/* =========================
-   CHECK COMMENTS
-========================= */
+// --------------------------------------------------
+// Get and moderate replies
+// --------------------------------------------------
+
+async function checkReplies(youtube, parentCommentId, videoId) {
+  let pageToken;
+
+  do {
+    const response = await youtube.comments.list({
+      part: "snippet",
+      parentId: parentCommentId,
+      maxResults: 100,
+      pageToken,
+    });
+
+    const replies = response.data.items || [];
+
+    for (const reply of replies) {
+      const snippet = reply.snippet;
+
+      const text =
+        snippet.textOriginal ||
+        snippet.textDisplay ||
+        "";
+
+      const author =
+        snippet.authorDisplayName ||
+        "Unknown";
+
+      await moderateSingleComment({
+        youtube,
+        commentId: reply.id,
+        text,
+        author,
+        videoId,
+        type: "Reply",
+      });
+    }
+
+    pageToken = response.data.nextPageToken;
+  } while (pageToken);
+}
+
+// --------------------------------------------------
+// Check comments AND replies
+// --------------------------------------------------
 
 async function checkComments() {
-  try {
-    const youtube =
-      getYouTubeClient();
+  let youtube;
 
-    const videoIds =
-      await getRecentVideos(
-        youtube
-      );
+  try {
+    youtube = getYouTubeClient();
+  } catch (error) {
+    console.error("YouTube authentication error:", error.message);
+    return;
+  }
+
+  try {
+    const videoIds = await getRecentVideos(youtube);
 
     console.log(
       `Checking ${videoIds.length} recent videos...`
     );
 
     for (const videoId of videoIds) {
-      let nextPageToken;
+      try {
+        let pageToken;
 
-      do {
-        const response =
-          await youtube.commentThreads.list({
+        do {
+          const response = await youtube.commentThreads.list({
             part: "snippet",
             videoId,
             maxResults: 100,
             order: "time",
-            pageToken:
-              nextPageToken
+            pageToken,
           });
 
-        const threads =
-          response.data.items || [];
+          const threads = response.data.items || [];
 
-        for (const thread of threads) {
-          const topLevelComment =
-            thread.snippet
-              ?.topLevelComment;
+          for (const thread of threads) {
+            const topLevel =
+              thread.snippet?.topLevelComment;
 
-          const commentId =
-            topLevelComment?.id;
+            if (!topLevel) continue;
 
-          const comment =
-            topLevelComment?.snippet
-              ?.textDisplay ||
-            topLevelComment?.snippet
-              ?.textOriginal;
+            const snippet = topLevel.snippet;
 
-          const author =
-            topLevelComment?.snippet
-              ?.authorDisplayName;
+            const text =
+              snippet.textOriginal ||
+              snippet.textDisplay ||
+              "";
 
-          if (
-            !commentId ||
-            !comment
-          ) {
-            continue;
-          }
+            const author =
+              snippet.authorDisplayName ||
+              "Unknown";
 
-          if (
-            processedComments.has(
-              commentId
-            )
-          ) {
-            continue;
-          }
-
-          processedComments.set(
-            commentId,
-            Date.now()
-          );
-
-          try {
-            const result =
-              await moderateComment(
-                comment
-              );
-
-            console.log("");
-            console.log(
-              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            );
-            console.log(
-              "COMMENT:",
-              comment
-            );
-            console.log(
-              "AUTHOR:",
-              author ||
-                "Unknown"
-            );
-            console.log(
-              "ACTION:",
-              result.action
-            );
-            console.log(
-              "CONFIDENCE:",
-              result.confidence
-            );
-            console.log(
-              "REASON:",
-              result.reason
-            );
-
-            let removed = false;
-
-            if (
-              result.action ===
-                "REMOVE" &&
-              result.confidence >=
-                REMOVE_CONFIDENCE
-            ) {
-              try {
-                await removeComment(
-                  youtube,
-                  commentId
-                );
-
-                removed = true;
-
-                console.log(
-                  "🗑️ COMMENT REMOVED"
-                );
-              } catch (error) {
-                console.error(
-                  "REMOVE ERROR:",
-                  error.response
-                    ?.data ||
-                    error.message
-                );
-              }
-            }
-
-            if (
-              result.action ===
-              "SPECIAL"
-            ) {
-              console.log(
-                "❤️ SPECIAL COMMENT DETECTED"
-              );
-
-              console.log(
-                "YouTube does not expose an official comment-heart write endpoint through the Data API."
-              );
-            }
-
-            await sendDiscordLog({
-              action:
-                result.action,
+            // Moderate the top-level comment.
+            await moderateSingleComment({
+              youtube,
+              commentId: topLevel.id,
+              text,
               author,
-              comment,
-              confidence:
-                result.confidence,
-              reason:
-                result.reason,
               videoId,
-              removed
+              type: "Top-level Comment",
             });
 
-            console.log(
-              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            );
-            console.log("");
+            // NEW:
+            // Moderate every reply belonging to this comment.
+            const replyCount =
+              thread.snippet?.totalReplyCount || 0;
 
-          } catch (error) {
-            console.error(
-              "COMMENT MODERATION ERROR:",
-              error.message
-            );
+            if (replyCount > 0) {
+              await checkReplies(
+                youtube,
+                topLevel.id,
+                videoId
+              );
+            }
           }
-        }
 
-        nextPageToken =
-          response.data
-            .nextPageToken;
-
-      } while (
-        nextPageToken
-      );
+          pageToken = response.data.nextPageToken;
+        } while (pageToken);
+      } catch (error) {
+        console.error(
+          `Error checking video ${videoId}:`,
+          error.response?.data || error.message
+        );
+      }
     }
 
-    cleanupProcessedComments();
+    // Keep the in-memory map from growing forever.
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
 
+    for (const [commentId, timestamp] of processedComments) {
+      if (timestamp < cutoff) {
+        processedComments.delete(commentId);
+      }
+    }
   } catch (error) {
     console.error(
-      "COMMENT CHECK ERROR:",
-      error.response
-        ?.data ||
-        error.message
+      "Comment checking error:",
+      error.response?.data || error.message
     );
   }
 }
 
-/* =========================
-   CLEANUP
-========================= */
+// --------------------------------------------------
+// Routes
+// --------------------------------------------------
 
-function cleanupProcessedComments() {
-  const expiration =
-    Date.now() -
-    24 * 60 * 60 * 1000;
+app.get("/", (req, res) => {
+  res.json({
+    status: "online",
+    service: "YouTube AI Moderator",
+    features: [
+      "AI moderation",
+      "Top-level comment moderation",
+      "Reply moderation",
+      "Automatic removal",
+      "Discord logging",
+    ],
+  });
+});
 
-  for (
-    const [
-      commentId,
-      timestamp
-    ] of processedComments.entries()
-  ) {
-    if (
-      timestamp < expiration
-    ) {
-      processedComments.delete(
-        commentId
-      );
+app.get("/auth/youtube", (req, res) => {
+  const url = oauth2Client.generateAuthUrl({
+    access_type: "offline",
+    prompt: "consent",
+    scope: YOUTUBE_SCOPES,
+  });
+
+  res.redirect(url);
+});
+
+app.get("/oauth2callback", async (req, res) => {
+  try {
+    const { code } = req.query;
+
+    if (!code) {
+      return res.status(400).send("Missing OAuth code.");
     }
-  }
-}
 
-/* =========================
-   MANUAL AI TEST
-========================= */
+    const { tokens } =
+      await oauth2Client.getToken(code);
 
-app.post(
-  "/moderate-test",
-  async (req, res) => {
-    try {
-      const {
-        comment
-      } = req.body;
+    oauth2Client.setCredentials(tokens);
 
-      if (
-        !comment ||
-        typeof comment !==
-          "string"
-      ) {
-        return res.status(400).json({
-          error:
-            "Please provide a comment."
-        });
-      }
+    res.send(`
+      <h1>YouTube Connected Successfully!</h1>
+      <p>You can close this page.</p>
+    `);
+  } catch (error) {
+    console.error("OAuth callback error:", error);
 
-      const result =
-        await moderateComment(
-          comment
-        );
-
-      res.json({
-        testMode: true,
-        action:
-          result.action,
-        confidence:
-          result.confidence,
-        reason:
-          result.reason,
-        youtubeActionTaken:
-          false
-      });
-
-    } catch (error) {
-      console.error(
-        "MODERATION ERROR:",
-        error.message
-      );
-
-      res.status(500).json({
-        error:
-          "AI moderation failed."
-      });
-    }
-  }
-);
-
-/* =========================
-   START SERVER
-========================= */
-
-app.listen(
-  PORT,
-  () => {
-    console.log(
-      `Moderator running on port ${PORT}`
+    res.status(500).send(
+      "YouTube authorization failed: " + error.message
     );
-
-    setTimeout(() => {
-      checkComments();
-
-      setInterval(
-        checkComments,
-        POLL_INTERVAL
-      );
-    }, 5000);
   }
-);
+});
+
+app.get("/test-youtube", async (req, res) => {
+  try {
+    const youtube = getYouTubeClient();
+
+    const response = await youtube.channels.list({
+      part: "snippet",
+      mine: true,
+    });
+
+    const channel = response.data.items?.[0];
+
+    res.json({
+      connected: true,
+      channel: channel
+        ? {
+            id: channel.id,
+            title: channel.snippet.title,
+          }
+        : null,
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      connected: false,
+      error:
+        error.response?.data ||
+        error.message,
+    });
+  }
+});
+
+app.get("/moderate-test", async (req, res) => {
+  try {
+    const text =
+      req.query.text ||
+      "your video sucks bro";
+
+    const result = await moderateText(text);
+
+    res.json({
+      text,
+      result,
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: error.message,
+    });
+  }
+});
+
+// --------------------------------------------------
+// Start server
+// --------------------------------------------------
+
+app.listen(PORT, () => {
+  console.log(
+    `YouTube AI Moderator running on port ${PORT}`
+  );
+
+  console.log(
+    `Polling every ${POLL_INTERVAL / 1000} seconds`
+  );
+
+  // Start immediately.
+  checkComments();
+
+  // Continue polling.
+  setInterval(checkComments, POLL_INTERVAL);
+});
